@@ -103,6 +103,15 @@ func (c *LibAVFFmpeg) StreamInfo(req entities.DonutAppetizer) (*entities.StreamI
 			c.l.Info("skipping media type", is.CodecParameters().MediaType())
 			continue
 		}
+
+		c.l.Infof("Stream #%d: type=%s codec=%s timebase=%v avg_frame_rate=%v r_frame_rate=%v",
+			is.Index(),
+			is.CodecParameters().MediaType().String(),
+			is.CodecParameters().CodecID().String(),
+			is.TimeBase().String(),
+			is.AvgFrameRate().String(),
+			is.RFrameRate().String())
+
 		streams = append(streams, c.m.FromLibAVStreamToEntityStream(is))
 	}
 	si := entities.StreamInfo{Streams: streams}

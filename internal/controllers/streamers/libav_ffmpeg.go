@@ -230,6 +230,15 @@ func (c *LibAVFFmpegStreamer) prepareInput(p *libAVParams, closer *astikit.Close
 
 		s := &streamContext{inputStream: is}
 
+		// Log the time base and other timing info
+		c.l.Infof("Stream #%d: type=%s codec=%s timebase=%v avg_frame_rate=%v r_frame_rate=%v",
+			is.Index(),
+			is.CodecParameters().MediaType().String(),
+			is.CodecParameters().CodecID().String(),
+			is.TimeBase().String(),
+			is.AvgFrameRate().String(),
+			is.RFrameRate().String())
+
 		if s.decCodec = astiav.FindDecoder(is.CodecParameters().CodecID()); s.decCodec == nil {
 			return errors.New("ffmpeg/libav: codec is missing")
 		}
@@ -332,13 +341,6 @@ func (c *LibAVFFmpegStreamer) prepareOutput(p *libAVParams, closer *astikit.Clos
 				s.encCodecContext.SetSampleFormat(s.decCodecContext.SampleFormat())
 			}
 			s.encCodecContext.SetTimeBase(s.decCodecContext.TimeBase())
-
-			// overriding with user provide config
-			if len(donut.Recipe.Audio.CodecContextOptions) > 0 {
-				for _, opt := range donut.Recipe.Audio.CodecContextOptions {
-					opt(s.encCodecContext)
-				}
-			}
 		}
 
 		if isVideo {
@@ -367,6 +369,22 @@ func (c *LibAVFFmpegStreamer) prepareOutput(p *libAVParams, closer *astikit.Clos
 
 		if err := s.encCodecContext.Open(s.encCodec, nil); err != nil {
 			return fmt.Errorf("opening encoder context failed: %w", err)
+		}
+
+		// Log input and output time bases
+		if s.decCodecContext.MediaType() == astiav.MediaTypeAudio {
+			c.l.Infof("Audio stream #%d: input_timebase=%v dec_timebase=%v sample_rate=%d",
+				is.Index(),
+				s.inputStream.TimeBase().String(),
+				s.decCodecContext.TimeBase().String(),
+				s.decCodecContext.SampleRate())
+		}
+		if s.decCodecContext.MediaType() == astiav.MediaTypeVideo {
+			c.l.Infof("Video stream #%d: input_timebase=%v dec_timebase=%v framerate=%v",
+				is.Index(),
+				s.inputStream.TimeBase().String(),
+				s.decCodecContext.TimeBase().String(),
+				s.decCodecContext.Framerate().String())
 		}
 	}
 	return nil
