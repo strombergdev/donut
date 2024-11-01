@@ -46,8 +46,9 @@ func (c *LibAVFFmpeg) Match(req *entities.RequestParams) bool {
 	return isRTMP || isSRT
 }
 
-// StreamInfo connects to the SRT stream to discovery media properties.
+// StreamInfo connects to the SRT stream to discover media properties.
 func (c *LibAVFFmpeg) StreamInfo(req entities.DonutAppetizer) (*entities.StreamInfo, error) {
+	c.l.Infof("StreamInfo request: URL=%s, Format=%s, Options=%v", req.URL, req.Format, req.Options)
 	closer := astikit.NewCloser()
 	defer closer.Close()
 
@@ -57,14 +58,37 @@ func (c *LibAVFFmpeg) StreamInfo(req entities.DonutAppetizer) (*entities.StreamI
 	}
 	closer.Add(inputFormatContext.Free)
 
+	inputURL := req.URL
+	if strings.Contains(strings.ToLower(inputURL), "srt://") {
+		urlParts := strings.Split(inputURL, "://")
+		if len(urlParts) == 2 {
+			hostPort := strings.Split(strings.Split(urlParts[1], "?")[0], ":")
+			if len(hostPort) == 2 {
+				inputURL = fmt.Sprintf("srt://0.0.0.0:%s", hostPort[1])
+			}
+		}
+	}
+
 	inputFormat, err := c.defineInputFormat(req.Format.String())
 	if err != nil {
 		return nil, err
 	}
-	inputOptions := c.defineInputOptions(req.Options, closer)
 
-	if err := inputFormatContext.OpenInput(req.URL, inputFormat, inputOptions); err != nil {
-		return nil, fmt.Errorf("error while inputFormatContext.OpenInput: (%s, %#v, %#v) %w", req.URL, inputFormat, inputOptions, err)
+	inputOptions := &astiav.Dictionary{}
+	closer.Add(inputOptions.Free)
+
+	if len(req.Options) > 0 {
+		for k, v := range req.Options {
+			inputOptions.Set(k.String(), v, 0)
+		}
+	}
+
+	if strings.Contains(strings.ToLower(inputURL), "srt://") {
+		inputOptions.Set("mode", "listener", 0)
+	}
+
+	if err := inputFormatContext.OpenInput(inputURL, inputFormat, inputOptions); err != nil {
+		return nil, fmt.Errorf("error while inputFormatContext.OpenInput: (%s, %#v, %#v) %w", inputURL, inputFormat, inputOptions, err)
 	}
 	closer.Add(inputFormatContext.CloseInput)
 

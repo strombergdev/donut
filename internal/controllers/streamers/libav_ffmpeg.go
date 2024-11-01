@@ -178,12 +178,41 @@ func (c *LibAVFFmpegStreamer) prepareInput(p *libAVParams, closer *astikit.Close
 	}
 	closer.Add(p.inputFormatContext.Free)
 
+	// Modify SRT URL to use 0.0.0.0 and remove query params
+	inputURL := donut.Recipe.Input.URL
+	if strings.Contains(strings.ToLower(inputURL), "srt://") {
+		urlParts := strings.Split(inputURL, "://")
+		if len(urlParts) == 2 {
+			// Remove any query parameters and just get host:port
+			hostPort := strings.Split(strings.Split(urlParts[1], "?")[0], ":")
+			if len(hostPort) == 2 {
+				inputURL = fmt.Sprintf("srt://0.0.0.0:%s", hostPort[1])
+			}
+		}
+	}
+
 	inputFormat, err := c.defineInputFormat(donut.Recipe.Input.Format.String())
 	if err != nil {
 		return err
 	}
-	inputOptions := c.defineInputOptions(donut, closer)
-	if err := p.inputFormatContext.OpenInput(donut.Recipe.Input.URL, inputFormat, inputOptions); err != nil {
+
+	// Create input options and add SRT listener mode
+	inputOptions := &astiav.Dictionary{}
+	closer.Add(inputOptions.Free)
+
+	// Copy existing options if any
+	if len(donut.Recipe.Input.Options) > 0 {
+		for k, v := range donut.Recipe.Input.Options {
+			inputOptions.Set(k.String(), v, 0)
+		}
+	}
+
+	// Add SRT listener mode
+	if strings.Contains(strings.ToLower(inputURL), "srt://") {
+		inputOptions.Set("mode", "listener", 0)
+	}
+
+	if err := p.inputFormatContext.OpenInput(inputURL, inputFormat, inputOptions); err != nil {
 		return fmt.Errorf("ffmpeg/libav: opening input failed %w", err)
 	}
 	closer.Add(p.inputFormatContext.CloseInput)
