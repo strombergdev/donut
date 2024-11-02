@@ -4,13 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 
 	"github.com/flavioribeiro/donut/internal/controllers"
 	"github.com/flavioribeiro/donut/internal/controllers/engine"
 	"github.com/flavioribeiro/donut/internal/entities"
 	"github.com/flavioribeiro/donut/internal/mapper"
+	"github.com/pion/interceptor"
 	"github.com/pion/webrtc/v3"
 	"go.uber.org/zap"
 )
@@ -57,7 +58,7 @@ func (h *WHEPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	// Read SDP offer from request body
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		h.l.Errorw("Failed to read request body", "error", err)
 		return fmt.Errorf("failed to read request body: %w", err)
@@ -92,50 +93,31 @@ func (h *WHEPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
 	}
 	h.l.Infof("DonutEngine: %#v", donutEngine)
 
-	// Get server-side media info
-	serverStreamInfo, err := donutEngine.ServerIngredients()
-	if err != nil {
-		h.l.Errorw("Failed to get server stream info", "error", err)
-		return fmt.Errorf("failed to get server stream info: %w", err)
-	}
-	h.l.Infof("ServerIngredients: %#v", serverStreamInfo)
-
-	// Get client-side media support
-	clientStreamInfo, err := donutEngine.ClientIngredients()
-	if err != nil {
-		h.l.Errorw("Failed to get client stream info", "error", err)
-		return fmt.Errorf("failed to get client stream info: %w", err)
-	}
-	h.l.Infof("ClientIngredients: %#v", clientStreamInfo)
-
-	// Create DonutRecipe
-	donutRecipe, err := donutEngine.RecipeFor(serverStreamInfo, clientStreamInfo)
-	if err != nil {
-		h.l.Errorw("Failed to create DonutRecipe", "error", err)
-		return fmt.Errorf("failed to create DonutRecipe: %w", err)
-	}
-	h.l.Infof("DonutRecipe: %#v", donutRecipe)
-
 	// Context to manage streaming lifecycle
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// Set up WebRTC connection
-	webRTCResponse, err := h.webRTCController.Setup(cancel, donutRecipe, params)
+	peerConnection, err := h.setupPeerConnection(&params, &offer)
 	if err != nil {
-		cancel()
-		h.l.Errorw("Failed to set up WebRTC", "error", err)
-		return fmt.Errorf("failed to set up WebRTC: %w", err)
+		h.l.Errorw("Failed to set up PeerConnection", "error", err)
+		return fmt.Errorf("failed to set up PeerConnection: %w", err)
 	}
-	h.l.Infof("WebRTCResponse: %#v", webRTCResponse)
+	defer peerConnection.Close()
 
-	// Add connection timeout headers
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Keep-Alive", "timeout=300")
+	// Send SDP answer back to the client
+	answerSDP := peerConnection.LocalDescription().SDP
+	w.Header().Set("Content-Type", "application/sdp")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(answerSDP)))
+	w.Header().Add("Location", r.URL.Path)
+	w.WriteHeader(http.StatusCreated)
+	if _, err := w.Write([]byte(answerSDP)); err != nil {
+		h.l.Errorw("Failed to write SDP answer", "error", err)
+		return fmt.Errorf("failed to write SDP answer: %w", err)
+	}
 
-	// Create a done channel to track connection state
+	// Start streaming media
 	done := make(chan struct{})
-
-	// Handle client disconnect
 	go func() {
 		<-r.Context().Done()
 		h.l.Info("Client disconnected")
@@ -143,43 +125,85 @@ func (h *WHEPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
 		cancel()
 	}()
 
-	// Start streaming media
-	go donutEngine.Serve(&entities.DonutParameters{
-		Cancel: cancel,
-		Ctx:    ctx,
-		Recipe: *donutRecipe,
-		OnClose: func() {
-			cancel()
-			webRTCResponse.Connection.Close()
-			close(done)
-		},
-		OnError: func(err error) {
-			if !errors.Is(err, context.Canceled) {
-				h.l.Errorw("Error while streaming", "error", err)
-			}
-		},
-		OnStream: func(st *entities.Stream) error {
-			return h.webRTCController.SendMetadata(webRTCResponse.Data, st)
-		},
-		OnVideoFrame: func(data []byte, c entities.MediaFrameContext) error {
-			return h.webRTCController.SendMediaSample(webRTCResponse.Video, data, c)
-		},
-		OnAudioFrame: func(data []byte, c entities.MediaFrameContext) error {
-			return h.webRTCController.SendMediaSample(webRTCResponse.Audio, data, c)
-		},
-	})
-
-	// Send SDP answer back to the client
-	answerSDP := webRTCResponse.LocalSDP.SDP
-	w.Header().Set("Content-Type", "application/sdp")
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(answerSDP)))
-	w.WriteHeader(http.StatusCreated)
-	if _, err := w.Write([]byte(answerSDP)); err != nil {
-		cancel()
-		return fmt.Errorf("failed to write SDP answer: %w", err)
-	}
+	go func() {
+		err := donutEngine.Serve(&entities.DonutParameters{
+			Cancel: cancel,
+			Ctx:    ctx,
+			Recipe: entities.DonutRecipe{}, // Use appropriate recipe
+			OnClose: func() {
+				cancel()
+				peerConnection.Close()
+				close(done)
+			},
+			OnError: func(err error) {
+				if !errors.Is(err, context.Canceled) {
+					h.l.Errorw("Error while streaming", "error", err)
+				}
+			},
+		})
+		if err != nil {
+			h.l.Errorw("Failed to serve DonutEngine", "error", err)
+		}
+	}()
 
 	// Keep the connection alive
 	<-done
 	return nil
+}
+
+func (h *WHEPHandler) setupPeerConnection(params *entities.RequestParams, offer *webrtc.SessionDescription) (*webrtc.PeerConnection, error) {
+	// Create a MediaEngine object to configure the supported codec
+	m := &webrtc.MediaEngine{}
+
+	// Register codecs based on DonutEngine capabilities
+	if err := h.webRTCController.RegisterCodecs(m); err != nil {
+		return nil, err
+	}
+
+	// Create an InterceptorRegistry
+	i := &interceptor.Registry{}
+
+	// Use the default set of Interceptors
+	if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
+		return nil, err
+	}
+
+	// Create the API object with the MediaEngine and Interceptors
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i))
+
+	// Create a new PeerConnection
+	peerConnection, err := api.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		return nil, err
+	}
+
+	// Set the remote SessionDescription
+	if err := peerConnection.SetRemoteDescription(*offer); err != nil {
+		return nil, err
+	}
+
+	// Add transceivers based on the remote description
+	for _, media := range offer.MediaDescriptions {
+		kind := webrtc.NewRTPCodecType(media.MediaName.Media)
+		if _, err := peerConnection.AddTransceiverFromKind(kind); err != nil {
+			return nil, err
+		}
+	}
+
+	// Create an answer
+	answer, err := peerConnection.CreateAnswer(nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set the local SessionDescription
+	if err := peerConnection.SetLocalDescription(answer); err != nil {
+		return nil, err
+	}
+
+	// Wait for ICE gathering to complete
+	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
+	<-gatherComplete
+
+	return peerConnection, nil
 }
