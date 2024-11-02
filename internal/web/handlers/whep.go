@@ -1,20 +1,26 @@
 package handlers
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/flavioribeiro/donut/internal/controllers"
 	"github.com/flavioribeiro/donut/internal/controllers/engine"
 	"github.com/flavioribeiro/donut/internal/entities"
 	"github.com/flavioribeiro/donut/internal/mapper"
-	"github.com/pion/interceptor"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v4"
 	"go.uber.org/zap"
 )
+
+var peerConnectionConfiguration = webrtc.Configuration{
+	ICEServers: []webrtc.ICEServer{
+		{
+			URLs: []string{"stun:stun.l.google.com:19302"},
+		},
+	},
+}
 
 type WHEPHandler struct {
 	c                *entities.Config
@@ -22,6 +28,8 @@ type WHEPHandler struct {
 	webRTCController *controllers.WebRTCController
 	mapper           *mapper.Mapper
 	donut            *engine.DonutEngineController
+	videoTrack       *webrtc.TrackLocalStaticRTP
+	audioTrack       *webrtc.TrackLocalStaticRTP
 }
 
 func NewWHEPHandler(
@@ -30,6 +38,7 @@ func NewWHEPHandler(
 	webRTCController *controllers.WebRTCController,
 	mapper *mapper.Mapper,
 	donut *engine.DonutEngineController,
+	tm *TrackManager,
 ) *WHEPHandler {
 	return &WHEPHandler{
 		c:                c,
@@ -37,173 +46,127 @@ func NewWHEPHandler(
 		webRTCController: webRTCController,
 		mapper:           mapper,
 		donut:            donut,
+		videoTrack:       tm.GetVideoTrack(),
+		audioTrack:       tm.GetAudioTrack(),
 	}
 }
 
 func (h *WHEPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
-	h.l.Infow("WHEP request received",
-		"method", r.Method,
-		"headers", r.Header,
-		"path", r.URL.Path,
-		"remote_addr", r.RemoteAddr)
-
-	// WHEP expects a POST request with 'application/sdp' Content-Type
-	if r.Method != http.MethodPost {
-		h.l.Errorw("Method not allowed", "method", r.Method)
-		return fmt.Errorf("method not allowed: %s", r.Method)
-	}
-
-	if r.Header.Get("Content-Type") != "application/sdp" {
-		return fmt.Errorf("unsupported media type")
-	}
-
-	// Read SDP offer from request body
-	body, err := io.ReadAll(r.Body)
+	// Read and log the offer details
+	offer, err := io.ReadAll(r.Body)
 	if err != nil {
-		h.l.Errorw("Failed to read request body", "error", err)
 		return fmt.Errorf("failed to read request body: %w", err)
 	}
-	defer r.Body.Close()
+	h.l.Infof("Received WHEP Offer SDP:\n%s\n", string(offer))
 
-	// Parse the SDP offer
-	offer := webrtc.SessionDescription{
-		Type: webrtc.SDPTypeOffer,
-		SDP:  string(body),
-	}
-
-	// Create request parameters
-	params := entities.RequestParams{
-		StreamURL: h.c.DefaultStreamURL,
-		StreamID:  h.c.DefaultStreamID,
-		Offer:     offer,
-	}
-
-	// Validate parameters
-	if err := params.Valid(); err != nil {
-		h.l.Errorw("Invalid request parameters", "error", err)
-		return fmt.Errorf("invalid request parameters: %w", err)
-	}
-	h.l.Infof("WHEP RequestParams: %s", params.String())
-
-	// Create DonutEngine
-	donutEngine, err := h.donut.EngineFor(&params)
+	// Create a new RTCPeerConnection
+	peerConnection, err := webrtc.NewPeerConnection(peerConnectionConfiguration)
 	if err != nil {
-		h.l.Errorw("Failed to create DonutEngine", "error", err)
-		return fmt.Errorf("failed to create DonutEngine: %w", err)
+		return fmt.Errorf("failed to create peer connection: %w", err)
 	}
-	h.l.Infof("DonutEngine: %#v", donutEngine)
 
-	// Context to manage streaming lifecycle
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Add ICE candidate logging
+	peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+		if candidate == nil {
+			return
+		}
+		h.l.Infof("Server ICE candidate (WHEP): Protocol: %s, Address: %s, Port: %d",
+			candidate.Protocol,
+			candidate.Address,
+			candidate.Port)
+	})
 
-	// Set up WebRTC connection
-	peerConnection, err := h.setupPeerConnection(&params, &offer)
+	// Log when ICE connection state changes
+	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
+		h.l.Infof("ICE Connection State has changed (WHEP): %s", connectionState.String())
+	})
+
+	// Add Video Track that is being written to from WHIP Session
+	rtpSender, err := peerConnection.AddTrack(h.videoTrack)
 	if err != nil {
-		h.l.Errorw("Failed to set up PeerConnection", "error", err)
-		return fmt.Errorf("failed to set up PeerConnection: %w", err)
-	}
-	defer peerConnection.Close()
-
-	// Send SDP answer back to the client
-	answerSDP := peerConnection.LocalDescription().SDP
-	w.Header().Set("Content-Type", "application/sdp")
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(answerSDP)))
-	w.Header().Add("Location", r.URL.Path)
-	w.WriteHeader(http.StatusCreated)
-	if _, err := w.Write([]byte(answerSDP)); err != nil {
-		h.l.Errorw("Failed to write SDP answer", "error", err)
-		return fmt.Errorf("failed to write SDP answer: %w", err)
+		return fmt.Errorf("failed to add video track: %w", err)
 	}
 
-	// Start streaming media
-	done := make(chan struct{})
-	go func() {
-		<-r.Context().Done()
-		h.l.Info("Client disconnected")
-		close(done)
-		cancel()
-	}()
+	// Add Audio Track that is being written to from WHIP Session
+	audioRtpSender, err := peerConnection.AddTrack(h.audioTrack)
+	if err != nil {
+		return fmt.Errorf("failed to add audio track: %w", err)
+	}
 
+	// Read incoming RTCP packets for both tracks
 	go func() {
-		err := donutEngine.Serve(&entities.DonutParameters{
-			Cancel: cancel,
-			Ctx:    ctx,
-			Recipe: entities.DonutRecipe{}, // Use appropriate recipe
-			OnClose: func() {
-				cancel()
-				peerConnection.Close()
-				close(done)
-			},
-			OnError: func(err error) {
-				if !errors.Is(err, context.Canceled) {
-					h.l.Errorw("Error while streaming", "error", err)
-				}
-			},
-		})
-		if err != nil {
-			h.l.Errorw("Failed to serve DonutEngine", "error", err)
+		rtcpBuf := make([]byte, 1500)
+		for {
+			if _, _, rtcpErr := rtpSender.Read(rtcpBuf); rtcpErr != nil {
+				h.l.Errorf("Failed to read video RTCP: %v", rtcpErr)
+				return
+			}
 		}
 	}()
 
-	// Keep the connection alive
-	<-done
-	return nil
+	go func() {
+		rtcpBuf := make([]byte, 1500)
+		for {
+			if _, _, rtcpErr := audioRtpSender.Read(rtcpBuf); rtcpErr != nil {
+				h.l.Errorf("Failed to read audio RTCP: %v", rtcpErr)
+				return
+			}
+		}
+	}()
+
+	return h.writeAnswer(w, peerConnection, offer)
 }
 
-func (h *WHEPHandler) setupPeerConnection(params *entities.RequestParams, offer *webrtc.SessionDescription) (*webrtc.PeerConnection, error) {
-	// Create a MediaEngine object to configure the supported codec
-	m := &webrtc.MediaEngine{}
-
-	// Register codecs based on DonutEngine capabilities
-	if err := h.webRTCController.RegisterCodecs(m); err != nil {
-		return nil, err
+func (h *WHEPHandler) writeAnswer(w http.ResponseWriter, peerConnection *webrtc.PeerConnection, offer []byte) error {
+	// Validate SDP offer
+	sdpOffer := string(offer)
+	if sdpOffer == "" || !strings.Contains(sdpOffer, "ice-ufrag") {
+		return fmt.Errorf("invalid SDP offer: missing ICE credentials")
 	}
 
-	// Create an InterceptorRegistry
-	i := &interceptor.Registry{}
+	// Set the handler for ICE connection state
+	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
+		h.l.Infof("ICE Connection State has changed: %s", connectionState.String())
 
-	// Use the default set of Interceptors
-	if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
-		return nil, err
-	}
-
-	// Create the API object with the MediaEngine and Interceptors
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i))
-
-	// Create a new PeerConnection
-	peerConnection, err := api.NewPeerConnection(webrtc.Configuration{})
-	if err != nil {
-		return nil, err
-	}
-
-	// Set the remote SessionDescription
-	if err := peerConnection.SetRemoteDescription(*offer); err != nil {
-		return nil, err
-	}
-
-	// Add transceivers based on the remote description
-	for _, media := range offer.MediaDescriptions {
-		kind := webrtc.NewRTPCodecType(media.MediaName.Media)
-		if _, err := peerConnection.AddTransceiverFromKind(kind); err != nil {
-			return nil, err
+		if connectionState == webrtc.ICEConnectionStateFailed {
+			if err := peerConnection.Close(); err != nil {
+				h.l.Errorf("Failed to close peer connection: %v", err)
+			}
 		}
+	})
+
+	if err := peerConnection.SetRemoteDescription(webrtc.SessionDescription{
+		Type: webrtc.SDPTypeOffer,
+		SDP:  string(offer),
+	}); err != nil {
+		return fmt.Errorf("failed to set remote description: %w", err)
 	}
 
-	// Create an answer
+	// Create channel that is blocked until ICE Gathering is complete
+	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
+
+	// Create answer
 	answer, err := peerConnection.CreateAnswer(nil)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("failed to create answer: %w", err)
 	}
 
-	// Set the local SessionDescription
-	if err := peerConnection.SetLocalDescription(answer); err != nil {
-		return nil, err
+	if err = peerConnection.SetLocalDescription(answer); err != nil {
+		return fmt.Errorf("failed to set local description: %w", err)
 	}
 
-	// Wait for ICE gathering to complete
-	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
+	// Block until ICE Gathering is complete, disabling trickle ICE
 	<-gatherComplete
 
-	return peerConnection, nil
+	// WHEP expects a Location header and a HTTP Status Code of 201
+	w.Header().Add("Location", "/whep")
+	w.WriteHeader(http.StatusCreated)
+
+	// Write Answer with Candidates as HTTP Response
+	_, err = fmt.Fprint(w, peerConnection.LocalDescription().SDP)
+	if err != nil {
+		return fmt.Errorf("failed to write response: %w", err)
+	}
+
+	return nil
 }

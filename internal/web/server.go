@@ -18,6 +18,10 @@ func NewHTTPServer(
 	log *zap.SugaredLogger,
 	lc fx.Lifecycle,
 ) *http.Server {
+	log.Infow("Creating HTTP server",
+		"host", c.HTTPHost,
+		"port", c.HTTPPort)
+
 	srv := &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", c.HTTPHost, c.HTTPPort),
 		Handler: mux,
@@ -26,21 +30,31 @@ func NewHTTPServer(
 		OnStart: func(ctx context.Context) error {
 			ln, err := net.Listen("tcp", srv.Addr)
 			if err != nil {
+				log.Errorw("Failed to start HTTP server", "error", err)
 				return err
 			}
-			log.Infow(fmt.Sprintf("Starting HTTP server. Open http://%s to access the demo", srv.Addr),
+			log.Infow("Starting HTTP server",
 				"addr", srv.Addr,
-			)
+				"handlers", []string{"/", "/demo/", "/doSignaling", "/whep"})
+
 			// profiling server
 			go func() {
-				http.ListenAndServe(fmt.Sprintf(":%d", c.PproffHTTPPort), nil)
+				log.Infow("Starting profiling server", "port", c.PproffHTTPPort)
+				if err := http.ListenAndServe(fmt.Sprintf(":%d", c.PproffHTTPPort), nil); err != nil {
+					log.Errorw("Profiling server failed", "error", err)
+				}
 			}()
 
 			// main server
-			go srv.Serve(ln)
+			go func() {
+				if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+					log.Errorw("HTTP server failed", "error", err)
+				}
+			}()
 			return nil
 		},
 		OnStop: func(ctx context.Context) error {
+			log.Info("Shutting down HTTP server")
 			return srv.Shutdown(ctx)
 		},
 	})

@@ -30,9 +30,14 @@ func Dependencies(enableICEMux bool) fx.Option {
 		// HTTP router
 		fx.Provide(NewServeMux),
 
+		// Track Manager for WebRTC
+		fx.Provide(handlers.NewTrackManager),
+
 		// HTTP handlers
 		fx.Provide(handlers.NewSignalingHandler),
 		fx.Provide(handlers.NewIndexHandler),
+		fx.Provide(handlers.NewWHEPHandler),
+		fx.Provide(handlers.NewWHIPHandler),
 
 		// ICE mux servers
 		fx.Provide(controllers.NewTCPICEServer),
@@ -47,10 +52,6 @@ func Dependencies(enableICEMux bool) fx.Option {
 		fx.Provide(probers.NewLibAVFFmpeg),
 
 		fx.Provide(engine.NewDonutEngineController),
-
-		// // Stream middlewares
-		// fx.Provide(streammiddlewares.NewStreamInfo),
-		// fx.Provide(streammiddlewares.NewEIA608),
 
 		// Mappers
 		fx.Provide(mapper.NewMapper),
