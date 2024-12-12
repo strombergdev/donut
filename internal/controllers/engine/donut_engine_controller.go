@@ -97,15 +97,6 @@ func (d *donutEngine) Serve(p *entities.DonutParameters) {
 }
 
 func (d *donutEngine) RecipeFor(server, client *entities.StreamInfo) (*entities.DonutRecipe, error) {
-	// TODO: implement proper matching
-	//
-	// suggestions:
-	//  if client.medias.contains(server.media)
-	//     bypass, server.media
-	//  else
-	//     preferable = [vp8, opus]
-	//     if union(preferable, client.medias)
-	//         transcode, preferable
 	appetizer, err := d.Appetizer()
 	if err != nil {
 		return nil, err
@@ -114,15 +105,9 @@ func (d *donutEngine) RecipeFor(server, client *entities.StreamInfo) (*entities.
 	r := &entities.DonutRecipe{
 		Input: appetizer,
 		Video: entities.DonutMediaTask{
-			// Action:               entities.DonutTranscode,
 			Action:               entities.DonutBypass,
 			Codec:                entities.H264,
 			DonutBitStreamFilter: &entities.DonutH264AnnexB,
-			// CodecContextOptions: []entities.LibAVOptionsCodecContext{
-			// 	entities.SetBitRate(100_000),
-			// 	entities.SetBaselineProfile(),
-			// 	entities.SetGopSize(30),
-			// },
 		},
 		Audio: entities.DonutMediaTask{
 			Action:            entities.DonutTranscode,
@@ -130,7 +115,8 @@ func (d *donutEngine) RecipeFor(server, client *entities.StreamInfo) (*entities.
 			DonutStreamFilter: entities.AudioResamplerFilter(48000),
 			CodecContextOptions: []entities.LibAVOptionsCodecContext{
 				entities.SetSampleRate(48000),
-				entities.SetSampleFormat("fltp"),
+				entities.SetBitRate(128000),
+				entities.SetSampleFormat("s16"),
 			},
 		},
 	}

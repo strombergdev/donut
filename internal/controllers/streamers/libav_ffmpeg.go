@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/asticode/go-astikit"
 	"github.com/flavioribeiro/donut/internal/entities"
 	"github.com/flavioribeiro/donut/internal/mapper"
+	"github.com/pion/rtp"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 )
@@ -94,7 +96,7 @@ func (c *LibAVFFmpegStreamer) Stream(donut *entities.DonutParameters) {
 
 	// it's useful for debugging
 	// astiav.SetLogLevel(astiav.LogLevelDebug)
-	astiav.SetLogLevel(astiav.LogLevelInfo)
+	astiav.SetLogLevel(astiav.LogLevelDebug)
 	astiav.SetLogCallback(func(_ astiav.Classer, l astiav.LogLevel, fmt, msg string) {
 		c.l.Infof("ffmpeg %s: - %s", c.libAVLogToString(l), strings.TrimSpace(msg))
 	})
@@ -137,11 +139,16 @@ func (c *LibAVFFmpegStreamer) Stream(donut *entities.DonutParameters) {
 			return
 		default:
 			if err := p.inputFormatContext.ReadFrame(inPkt); err != nil {
-				if errors.Is(err, astiav.ErrEof) {
-					c.l.Info("streaming has ended")
+				if errors.Is(err, astiav.ErrEof) || errors.Is(err, io.EOF) {
+					c.l.Info("End of stream reached")
+					return
+				}
+				if errors.Is(err, context.Canceled) || errors.Is(err, io.ErrClosedPipe) {
+					c.l.Info("Stream canceled or pipe closed")
 					return
 				}
 				c.onError(err, donut)
+				return
 			}
 
 			s, ok := p.streams[inPkt.StreamIndex()]
@@ -195,7 +202,6 @@ func (c *LibAVFFmpegStreamer) prepareInput(p *libAVParams, closer *astikit.Close
 	if err != nil {
 		return err
 	}
-
 	// Create input options and add SRT listener mode
 	inputOptions := &astiav.Dictionary{}
 	closer.Add(inputOptions.Free)
@@ -678,14 +684,28 @@ func (c *LibAVFFmpegStreamer) encodeFrame(p *libAVParams, f *astiav.Frame, s *st
 			return fmt.Errorf("receiving packet failed: %w", err)
 		}
 
-		// TODO: check if we need to swap
-		// pkt.RescaleTs(s.inputStream.TimeBase(), s.decCodecContext.TimeBase())
 		s.encPkt.RescaleTs(s.inputStream.TimeBase(), s.encCodecContext.TimeBase())
+
+		// Create RTP packet
+		rtpPacket := &rtp.Packet{
+			Header: rtp.Header{
+				Version:        2,
+				PayloadType:    96, // Adjust based on codec
+				SequenceNumber: 0,  // Will be set by WebRTC
+				Timestamp:      uint32(s.encPkt.Pts()),
+				SSRC:           0, // Will be set by WebRTC
+			},
+			Payload: s.encPkt.Data(),
+		}
 
 		isVideo := s.decCodecContext.MediaType() == astiav.MediaTypeVideo
 		if isVideo {
 			if donut.OnVideoFrame != nil {
-				if err := donut.OnVideoFrame(s.encPkt.Data(), entities.MediaFrameContext{
+				rtpData, marshalErr := rtpPacket.Marshal()
+				if marshalErr != nil {
+					return fmt.Errorf("failed to marshal video RTP packet: %w", marshalErr)
+				}
+				if err := donut.OnVideoFrame(rtpData, entities.MediaFrameContext{
 					PTS:      int(s.encPkt.Pts()),
 					DTS:      int(s.encPkt.Dts()),
 					Duration: c.defineVideoDuration(s, s.encPkt),
@@ -698,7 +718,12 @@ func (c *LibAVFFmpegStreamer) encodeFrame(p *libAVParams, f *astiav.Frame, s *st
 		isAudio := s.decCodecContext.MediaType() == astiav.MediaTypeAudio
 		if isAudio {
 			if donut.OnAudioFrame != nil {
-				if err := donut.OnAudioFrame(s.encPkt.Data(), entities.MediaFrameContext{
+				rtpPacket.PayloadType = 111 // Opus
+				rtpData, marshalErr := rtpPacket.Marshal()
+				if marshalErr != nil {
+					return fmt.Errorf("failed to marshal audio RTP packet: %w", marshalErr)
+				}
+				if err := donut.OnAudioFrame(rtpData, entities.MediaFrameContext{
 					PTS:      int(s.encPkt.Pts()),
 					DTS:      int(s.encPkt.Dts()),
 					Duration: c.defineAudioDuration(s, s.encPkt),

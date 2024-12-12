@@ -1,16 +1,18 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
-	"github.com/flavioribeiro/donut/internal/controllers"
 	"github.com/flavioribeiro/donut/internal/controllers/engine"
 	"github.com/flavioribeiro/donut/internal/entities"
 	"github.com/flavioribeiro/donut/internal/mapper"
-	"github.com/pion/webrtc/v4"
+	webrtc3 "github.com/pion/webrtc/v3"
+	webrtc "github.com/pion/webrtc/v4" // or
+	"github.com/pion/webrtc/v4/pkg/media"
 	"go.uber.org/zap"
 )
 
@@ -23,31 +25,28 @@ var peerConnectionConfiguration = webrtc.Configuration{
 }
 
 type WHEPHandler struct {
-	c                *entities.Config
-	l                *zap.SugaredLogger
-	webRTCController *controllers.WebRTCController
-	mapper           *mapper.Mapper
-	donut            *engine.DonutEngineController
-	videoTrack       *webrtc.TrackLocalStaticRTP
-	audioTrack       *webrtc.TrackLocalStaticRTP
+	c          *entities.Config
+	l          *zap.SugaredLogger
+	mapper     *mapper.Mapper
+	donut      *engine.DonutEngineController
+	videoTrack *webrtc.TrackLocalStaticRTP
+	audioTrack *webrtc.TrackLocalStaticRTP
 }
 
 func NewWHEPHandler(
 	c *entities.Config,
 	log *zap.SugaredLogger,
-	webRTCController *controllers.WebRTCController,
 	mapper *mapper.Mapper,
 	donut *engine.DonutEngineController,
 	tm *TrackManager,
 ) *WHEPHandler {
 	return &WHEPHandler{
-		c:                c,
-		l:                log,
-		webRTCController: webRTCController,
-		mapper:           mapper,
-		donut:            donut,
-		videoTrack:       tm.GetVideoTrack(),
-		audioTrack:       tm.GetAudioTrack(),
+		c:          c,
+		l:          log,
+		mapper:     mapper,
+		donut:      donut,
+		videoTrack: tm.GetVideoTrack(),
+		audioTrack: tm.GetAudioTrack(),
 	}
 }
 
@@ -81,19 +80,97 @@ func (h *WHEPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
 		h.l.Infof("ICE Connection State has changed (WHEP): %s", connectionState.String())
 	})
 
-	// Add Video Track that is being written to from WHIP Session
-	rtpSender, err := peerConnection.AddTrack(h.videoTrack)
+	params, err := h.createAndValidateParams(r)
+
+	donutEngine, err := h.donut.EngineFor(&params)
+	if err != nil {
+		return err
+	}
+	h.l.Infof("DonutEngine %#v", donutEngine)
+
+	// server side media info
+	serverStreamInfo, err := donutEngine.ServerIngredients()
+	if err != nil {
+		return err
+	}
+	h.l.Infof("ServerIngredients %#v", serverStreamInfo)
+
+	// client side media support
+	clientStreamInfo, err := donutEngine.ClientIngredients()
+	if err != nil {
+		return err
+	}
+	h.l.Infof("ClientIngredients %#v", clientStreamInfo)
+
+	donutRecipe, err := donutEngine.RecipeFor(serverStreamInfo, clientStreamInfo)
+	if err != nil {
+		return err
+	}
+	h.l.Infof("DonutRecipe %#v", donutRecipe)
+
+	// We can't defer calling cancel here because it'll live alongside the stream.
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Create video and audio tracks for this connection
+	videoTrack, err := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: "video/h264"},
+		"video",
+		"pion-rtsp",
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create video track: %w", err)
+	}
+	audioTrack, err := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{MimeType: "audio/opus"},
+		"audio",
+		"pion-rtsp",
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create audio track: %w", err)
+	}
+
+	// Add tracks to peer connection
+	rtpSender, err := peerConnection.AddTrack(videoTrack)
 	if err != nil {
 		return fmt.Errorf("failed to add video track: %w", err)
 	}
-
-	// Add Audio Track that is being written to from WHIP Session
-	audioRtpSender, err := peerConnection.AddTrack(h.audioTrack)
+	audioRtpSender, err := peerConnection.AddTrack(audioTrack)
 	if err != nil {
 		return fmt.Errorf("failed to add audio track: %w", err)
 	}
 
-	// Read incoming RTCP packets for both tracks
+	go donutEngine.Serve(&entities.DonutParameters{
+		Cancel: cancel,
+		Ctx:    ctx,
+		Recipe: *donutRecipe,
+		OnClose: func() {
+			cancel()
+			peerConnection.Close()
+		},
+		OnError: func(err error) {
+			h.l.Errorw("error while streaming", "error", err)
+		},
+		OnVideoFrame: func(data []byte, c entities.MediaFrameContext) error {
+			if err := videoTrack.WriteSample(media.Sample{
+				Data:     data,
+				Duration: c.Duration,
+			}); err != nil {
+				return fmt.Errorf("failed to write video: %w", err)
+			}
+			return nil
+		},
+		OnAudioFrame: func(data []byte, c entities.MediaFrameContext) error {
+			if err := audioTrack.WriteSample(media.Sample{
+				Data:     data,
+				Duration: c.Duration,
+			}); err != nil {
+				return fmt.Errorf("failed to write audio: %w", err)
+			}
+			return nil
+		},
+	})
+
+	// Handle RTCP packets
 	go func() {
 		rtcpBuf := make([]byte, 1500)
 		for {
@@ -114,7 +191,17 @@ func (h *WHEPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
 		}
 	}()
 
-	return h.writeAnswer(w, peerConnection, offer)
+	// Add this to the ServeHTTP function after creating the peer connection
+	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		h.l.Infof("Got track: %s (%s)", track.ID(), track.Kind())
+	})
+
+	peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		h.l.Infof("Connection state changed: %s", state.String())
+	})
+
+	h.writeAnswer(w, peerConnection, offer)
+	return nil
 }
 
 func (h *WHEPHandler) writeAnswer(w http.ResponseWriter, peerConnection *webrtc.PeerConnection, offer []byte) error {
@@ -169,4 +256,34 @@ func (h *WHEPHandler) writeAnswer(w http.ResponseWriter, peerConnection *webrtc.
 	}
 
 	return nil
+}
+
+func (h *WHEPHandler) createAndValidateParams(r *http.Request) (entities.RequestParams, error) {
+	if r.Method != http.MethodPost {
+		return entities.RequestParams{}, entities.ErrHTTPPostOnly
+	}
+
+	// For WHEP, we'll use the configured default stream URL and ID
+	params := entities.RequestParams{
+		StreamURL: h.c.DefaultStreamURL,
+		StreamID:  h.c.DefaultStreamID,
+	}
+
+	// Read the SDP offer from the request body
+	offerBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		return entities.RequestParams{}, fmt.Errorf("failed to read offer: %w", err)
+	}
+
+	// Parse the SDP offer using v4
+	params.Offer = webrtc3.SessionDescription{
+		Type: webrtc3.SDPTypeOffer,
+		SDP:  string(offerBytes),
+	}
+
+	if err := params.Valid(); err != nil {
+		return entities.RequestParams{}, err
+	}
+
+	return params, nil
 }

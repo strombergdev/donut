@@ -25,7 +25,7 @@ func NewTrackManager(logger *zap.SugaredLogger) (*TrackManager, error) {
 			SDPFmtpLine: "",
 		},
 		"video",
-		"pion-video",
+		"",
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create video track: %w", err)
@@ -40,7 +40,7 @@ func NewTrackManager(logger *zap.SugaredLogger) (*TrackManager, error) {
 			SDPFmtpLine: "minptime=10;useinbandfec=1",
 		},
 		"audio",
-		"pion-audio",
+		"",
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audio track: %w", err)

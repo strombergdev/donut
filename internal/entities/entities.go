@@ -7,7 +7,8 @@ import (
 	"time"
 
 	"github.com/asticode/go-astiav"
-	"github.com/pion/webrtc/v3"
+	pionv3 "github.com/pion/webrtc/v3"
+	pionv4 "github.com/pion/webrtc/v4"
 )
 
 const (
@@ -15,17 +16,17 @@ const (
 )
 
 type WebRTCSetupResponse struct {
-	Connection *webrtc.PeerConnection
-	Video      *webrtc.TrackLocalStaticSample
-	Audio      *webrtc.TrackLocalStaticSample
-	Data       *webrtc.DataChannel
-	LocalSDP   *webrtc.SessionDescription
+	Connection *pionv3.PeerConnection
+	Video      *pionv3.TrackLocalStaticSample
+	Audio      *pionv3.TrackLocalStaticSample
+	Data       *pionv3.DataChannel
+	LocalSDP   *pionv3.SessionDescription
 }
 
 type RequestParams struct {
 	StreamURL string
 	StreamID  string
-	Offer     webrtc.SessionDescription
+	Offer     pionv3.SessionDescription
 }
 
 func (p *RequestParams) Valid() error {
@@ -50,6 +51,33 @@ func (p *RequestParams) Valid() error {
 	return nil
 }
 
+type RequestParamsV4 struct {
+	StreamURL string
+	StreamID  string
+	Offer     pionv4.SessionDescription
+}
+
+func (p *RequestParamsV4) Valid() error {
+	if p == nil {
+		return ErrMissingParamsOffer
+	}
+
+	if p.StreamID == "" {
+		return ErrMissingStreamID
+	}
+
+	if p.StreamURL == "" {
+		return ErrMissingStreamURL
+	}
+	isRTMP := strings.Contains(strings.ToLower(p.StreamURL), "rtmp")
+	isSRT := strings.Contains(strings.ToLower(p.StreamURL), "srt")
+
+	if !(isRTMP || isSRT) {
+		return ErrUnsupportedStreamURL
+	}
+
+	return nil
+}
 func (p *RequestParams) String() string {
 	if p == nil {
 		return ""
@@ -277,7 +305,7 @@ type Config struct {
 	PproffHTTPPort int32  `required:"true" default:"6060"`
 
 	TCPICEPort         int      `required:"true" default:"8081"`
-	UDPICEPort         int      `required:"true" default:"8081"`
+	UDPICEPort         int      `required:"true" default:"8094"`
 	ICEReadBufferSize  int      `required:"true" default:"8"`
 	ICEExternalIPsDNAT []string `required:"true" default:"127.0.0.1"`
 	EnableICEMux       bool     `require:"true" default:"false"`
@@ -290,4 +318,8 @@ type Config struct {
 	SRTReadBufferSizeBytes int `required:"true" default:"1316"`
 
 	ProbingSize int `required:"true" default:"120"`
+
+	// Add the following fields to fix the compilation error
+	DefaultStreamURL string `required:"true" default:"srt://localhost:40053"`
+	DefaultStreamID  string `required:"true" default:"stream-id"`
 }
